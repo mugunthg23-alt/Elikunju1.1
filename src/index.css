@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-sans: 'DM Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+    --bg-canvas: #101827;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: #101827;
+    color: #f1f5f9;
+    font-family: var(--font-sans);
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.touch-surface {
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+@keyframes ripple-out {
+  0% {
+    transform: translate(-50%, -50%) scale(0.45);
+    opacity: 0.72;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1.85);
+    opacity: 0;
+  }
+}
+
+.animate-mouse-ripple {
+  animation: ripple-out 260ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes guide-scroll-thumb {
+  0%, 100% {
+    transform: translateY(-16px);
+    opacity: 0.75;
+  }
+  50% {
+    transform: translateY(16px);
+    opacity: 1;
+  }
+}
+
+@keyframes guide-tap-ring {
+  0% {
+    transform: scale(0.55);
+    opacity: 0;
+  }
+  25% {
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+
+@keyframes guide-zone-pulse {
+  0%, 100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+.animate-guide-scroll {
+  animation: guide-scroll-thumb 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+.animate-guide-tap {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: guide-tap-ring 1.7s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.animate-guide-zone {
+  animation: guide-zone-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-mouse-ripple,
+  .animate-guide-scroll,
+  .animate-guide-tap,
+  .animate-guide-zone {
+    animation: none;
+  }
+}

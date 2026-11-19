@@ -1,0 +1,6 @@
+{
+  "name": "eli kunju",
+  "description": "Low-latency Wi-Fi mobile mouse controller with touch gestures, motion tracking, left/right click zones, and head scroll bar.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
