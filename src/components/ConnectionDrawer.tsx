@@ -12,6 +12,11 @@ import {
 import type { ClientRole, MousePreferences } from '../types/mouse';
 import type { SocketStatus } from '../hooks/useMouseSocket';
 import type { MotionPermissionState } from '../hooks/usePhoneMotion';
+import {
+  buildClientNodeBridgeScript,
+  buildClientPythonBridgeScript,
+  triggerTextFileDownload,
+} from '../lib/bridgeScripts';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ConnectionDrawerProps {
@@ -63,7 +68,7 @@ export const ConnectionDrawer: React.FC<ConnectionDrawerProps> = ({
     e.preventDefault();
     const cleaned = roomInput.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8);
     if (cleaned.length >= 2) {
-      onPreferencesChange({ roomId: cleaned, connectionMode: 'relay' });
+      onPreferencesChange({ roomId: cleaned, relayOrigin: '', connectionMode: 'relay' });
       setRoomInput(cleaned);
     }
   };
@@ -71,7 +76,7 @@ export const ConnectionDrawer: React.FC<ConnectionDrawerProps> = ({
   const generateNewRoom = () => {
     const code = String(Math.floor(1000 + Math.random() * 9000));
     setRoomInput(code);
-    onPreferencesChange({ roomId: code, connectionMode: 'relay' });
+    onPreferencesChange({ roomId: code, relayOrigin: '', connectionMode: 'relay' });
   };
 
   const peerConnected =
@@ -351,32 +356,39 @@ export const ConnectionDrawer: React.FC<ConnectionDrawerProps> = ({
                   Local IP: <span className="font-mono-num text-slate-300">{lanAddresses[0]}</span>
                 </p>
               )}
-              <a
-                href={`/api/desktop-bridge/hotspot?room=${encodeURIComponent(preferences.roomId)}`}
-                download="eli-kunju-hotspot.py"
-                className="inline-flex w-full min-h-[40px] items-center justify-center gap-2 rounded-xl border border-slate-700 bg-[#0E1524] px-3 text-xs font-medium text-slate-200 hover:border-[#C78E65]/70 whitespace-nowrap transition-colors"
-              >
-                <Download className="w-3.5 h-3.5 shrink-0" />
-                <span>Mobile Hotspot Bridge (.py)</span>
-              </a>
               <div className="grid grid-cols-2 gap-2">
-                <a
-                  href={`/api/desktop-bridge/python?room=${encodeURIComponent(preferences.roomId)}`}
-                  download="eli-kunju-bridge.py"
-                  className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-[#0E1524] px-3 text-xs font-medium text-slate-300 hover:bg-slate-800 whitespace-nowrap transition-colors"
+                <button
+                  type="button"
+                  onClick={() =>
+                    triggerTextFileDownload(
+                      'eli-kunju-bridge.py',
+                      buildClientPythonBridgeScript(preferences.roomId),
+                      'text/x-python;charset=utf-8'
+                    )
+                  }
+                  className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-[#0E1524] px-3 text-xs font-medium text-slate-200 hover:border-[#C78E65]/70 hover:bg-slate-800 whitespace-nowrap transition-colors"
                 >
                   <Download className="w-3.5 h-3.5 shrink-0" />
-                  <span>Python</span>
-                </a>
-                <a
-                  href={`/api/desktop-bridge/node?room=${encodeURIComponent(preferences.roomId)}`}
-                  download="eli-kunju-bridge.mjs"
-                  className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-[#0E1524] px-3 text-xs font-medium text-slate-300 hover:bg-slate-800 whitespace-nowrap transition-colors"
+                  <span>Python (.py)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    triggerTextFileDownload(
+                      'eli-kunju-bridge.mjs',
+                      buildClientNodeBridgeScript(preferences.roomId),
+                      'application/javascript;charset=utf-8'
+                    )
+                  }
+                  className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-[#0E1524] px-3 text-xs font-medium text-slate-200 hover:border-[#C78E65]/70 hover:bg-slate-800 whitespace-nowrap transition-colors"
                 >
                   <Download className="w-3.5 h-3.5 shrink-0" />
-                  <span>Node.js</span>
-                </a>
+                  <span>Node.js (.mjs)</span>
+                </button>
               </div>
+              <p className="font-mono-num text-[11px] text-slate-400">
+                Works on Netlify: <span className="text-slate-200">python eli-kunju-bridge.py</span>
+              </p>
             </div>
           </details>
 

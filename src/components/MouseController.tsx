@@ -31,10 +31,11 @@ const BODY_RX = 158;
 const BODY_RY = 104;
 const NECK_Y = 286;
 
-const TAP_MAX_DIST = 10;
-const TAP_MAX_MS = 320;
-const DOUBLE_TAP_MS = 300;
-const HOLD_DRAG_MS = 340;
+const TAP_MAX_DIST = 14;
+const HEAD_SCROLL_DEADZONE = 2.5;
+const TAP_MAX_MS = 380;
+const DOUBLE_TAP_MS = 310;
+const HOLD_DRAG_MS = 420;
 
 export const MouseController: React.FC<MouseControllerProps> = ({
   preferences,
@@ -185,8 +186,11 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     if (showGuide) {
       onDismissGuide?.();
     }
-    // Ignore secondary non-primary mouse buttons except standard right-click handled cleanly
-    e.currentTarget.setPointerCapture(e.pointerId);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Some mobile WebViews throw on touch setPointerCapture; continue cleanly without aborting gesture
+    }
     pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     const g = gestureRef.current;
@@ -271,19 +275,20 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     g.lastY = e.clientY;
 
     const totalDist = Math.hypot(e.clientX - g.startX, e.clientY - g.startY);
-    if (totalDist > TAP_MAX_DIST && !g.moved) {
+    const moveThreshold = g.zone === 'head' ? HEAD_SCROLL_DEADZONE : TAP_MAX_DIST;
+    if (totalDist > moveThreshold && !g.moved) {
       g.moved = true;
       clearHoldTimer();
     }
 
     if (!g.moved && !g.draggingButton) return;
 
-    // Mouse head acts strictly as a tactile scroll bar
+    // Mouse head acts strictly as an instant, responsive tactile scroll bar
     if (g.zone === 'head') {
       const sign = preferences.naturalScroll ? -1 : 1;
-      const scrollDx = rawDx * sign * preferences.scrollSensitivity * 0.45;
-      const scrollDy = rawDy * sign * preferences.scrollSensitivity * 0.72;
-      if (Math.abs(scrollDx) > 0.1 || Math.abs(scrollDy) > 0.1) {
+      const scrollDx = rawDx * sign * preferences.scrollSensitivity * 0.6;
+      const scrollDy = rawDy * sign * preferences.scrollSensitivity * 1.05;
+      if (Math.abs(scrollDx) > 0.08 || Math.abs(scrollDy) > 0.08) {
         onCommand({ type: 'scroll', dx: scrollDx, dy: scrollDy });
         flashScrollIndicator(rawDy);
       }

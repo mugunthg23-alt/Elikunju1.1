@@ -2,13 +2,18 @@ import React, { useEffect, useRef, useState } from 'react';
 import jsQR from 'jsqr';
 import { Camera, Check, X } from 'lucide-react';
 
+export interface ScannedQRTarget {
+  roomId: string;
+  relayOrigin: string;
+}
+
 interface QRScannerModalProps {
   open: boolean;
   onClose: () => void;
-  onScannedRoom: (roomId: string) => void;
+  onScannedRoom: (target: ScannedQRTarget) => void;
 }
 
-function extractRoomCode(raw: string): string | null {
+function parseQRPayload(raw: string): ScannedQRTarget | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
@@ -17,7 +22,11 @@ function extractRoomCode(raw: string): string | null {
     const param = url.searchParams.get('room');
     if (param) {
       const cleaned = param.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8);
-      if (cleaned.length >= 2) return cleaned;
+      if (cleaned.length >= 2) {
+        const relayOrigin =
+          url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : '';
+        return { roomId: cleaned, relayOrigin };
+      }
     }
   } catch {
     // Not a URL; check plain code formats
@@ -25,11 +34,11 @@ function extractRoomCode(raw: string): string | null {
 
   const prefixMatch = trimmed.match(/^(?:elikunju|room):([a-zA-Z0-9]{2,8})$/i);
   if (prefixMatch) {
-    return prefixMatch[1].toUpperCase();
+    return { roomId: prefixMatch[1].toUpperCase(), relayOrigin: '' };
   }
 
   if (/^[a-zA-Z0-9]{3,8}$/.test(trimmed)) {
-    return trimmed.toUpperCase();
+    return { roomId: trimmed.toUpperCase(), relayOrigin: '' };
   }
 
   return null;
@@ -100,15 +109,15 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
 
       const imageData = ctx.getImageData(0, 0, targetW, targetH);
       const decoded = jsQR(imageData.data, targetW, targetH, {
-        inversionAttempts: 'dontInvert',
+        inversionAttempts: 'attemptBoth',
       });
 
       if (decoded?.data) {
-        const room = extractRoomCode(decoded.data);
-        if (room) {
+        const parsed = parseQRPayload(decoded.data);
+        if (parsed) {
           cancelled = true;
           stopCamera();
-          setScannedCode(room);
+          setScannedCode(parsed.roomId);
           if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
             try {
               navigator.vibrate(25);
@@ -117,8 +126,8 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
             }
           }
           window.setTimeout(() => {
-            onScannedRef.current(room);
-          }, 360);
+            onScannedRef.current(parsed);
+          }, 320);
         }
       }
     };
@@ -171,7 +180,7 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
     e.preventDefault();
     const cleaned = manualCode.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8);
     if (cleaned.length >= 2) {
-      onScannedRoom(cleaned);
+      onScannedRoom({ roomId: cleaned, relayOrigin: '' });
       setManualCode('');
     }
   };
@@ -229,14 +238,14 @@ export const QRScannerModal: React.FC<QRScannerModalProps> = ({
           </div>
         )}
 
-        {/* Scanned confirmation overlay */}
+        {/* Honest scanned status overlay (real connection confirmed after socket joins) */}
         {scannedCode && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#101827]/90 backdrop-blur-xs p-6 text-center">
             <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#C78E65] text-[#101827]">
               <Check className="h-7 w-7" strokeWidth={2.5} />
             </div>
             <p className="mt-4 font-display text-lg font-semibold text-white">
-              Laptop Connected
+              QR Scanned — Linking…
             </p>
             <p className="mt-1 font-mono-num text-sm text-slate-300">
               Room {scannedCode}

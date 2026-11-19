@@ -11,15 +11,35 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 interface PeerClient {
-  ws: WebSocket;
+  id: string;
+  transport: 'ws' | 'sse';
+  ws?: WebSocket;
+  sseRes?: express.Response;
   roomId: string | null;
   role: ClientRole | null;
 }
 
 const rooms = new Map<string, Set<PeerClient>>();
+let peerSeq = 0;
 
 function sanitizeRoomId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8);
+}
+
+function sendToPeer(peer: PeerClient, serializedJson: string): void {
+  if (peer.transport === 'ws') {
+    if (peer.ws && peer.ws.readyState === WebSocket.OPEN) {
+      peer.ws.send(serializedJson);
+    }
+    return;
+  }
+  if (peer.sseRes && !peer.sseRes.writableEnded) {
+    try {
+      peer.sseRes.write(`data: ${serializedJson}\n\n`);
+    } catch {
+      // Ignore closed stream writes
+    }
+  }
 }
 
 function getLocalLanAddresses(): string[] {
@@ -55,9 +75,7 @@ function broadcastRoomStatus(roomId: string): void {
   } satisfies ServerToClientMessage);
 
   for (const peer of members) {
-    if (peer.ws.readyState === WebSocket.OPEN) {
-      peer.ws.send(payload);
-    }
+    sendToPeer(peer, payload);
   }
 }
 
@@ -74,6 +92,48 @@ function removeFromRoom(peer: PeerClient): void {
     }
   }
   peer.roomId = null;
+}
+
+function joinPeerToRoom(peer: PeerClient, rawRoomId: string, role: ClientRole): string | null {
+  const cleanRoom = sanitizeRoomId(rawRoomId || '');
+  if (!cleanRoom) return null;
+
+  removeFromRoom(peer);
+  peer.roomId = cleanRoom;
+  peer.role = role === 'desktop' ? 'desktop' : 'mobile';
+
+  let members = rooms.get(cleanRoom);
+  if (!members) {
+    members = new Set();
+    rooms.set(cleanRoom, members);
+  }
+
+  // Hand active mouse control to the most recently joined mobile peer in this room
+  if (peer.role === 'mobile') {
+    for (const existing of Array.from(members)) {
+      if (existing !== peer && existing.role === 'mobile') {
+        members.delete(existing);
+        existing.roomId = null;
+      }
+    }
+  }
+
+  members.add(peer);
+  broadcastRoomStatus(cleanRoom);
+  return cleanRoom;
+}
+
+function relayCommandToDesktops(roomId: string, serializedJson: string, sender?: PeerClient): number {
+  const members = rooms.get(roomId);
+  if (!members) return 0;
+  let delivered = 0;
+  for (const target of members) {
+    if (target !== sender && target.role === 'desktop') {
+      sendToPeer(target, serializedJson);
+      delivered += 1;
+    }
+  }
+  return delivered;
 }
 
 function buildPythonBridgeScript(defaultRelayUrl: string, defaultRoomId: string): string {
@@ -376,6 +436,20 @@ async function startServer() {
   const server = http.createServer(app);
   const PORT = Number(process.env.PORT) || 3000;
 
+  app.use(express.json({ limit: '64kb' }));
+
+  // Allow cross-origin API relay when a mobile scans a QR code from a different origin
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
   });
@@ -385,6 +459,78 @@ async function startServer() {
       lanAddresses: getLocalLanAddresses(),
       port: PORT,
     });
+  });
+
+  // HTTP Server-Sent Events fallback stream for networks where WebSockets are blocked
+  app.get('/api/room/:roomId/stream', (req, res) => {
+    const cleanRoom = sanitizeRoomId(String(req.params.roomId || ''));
+    const role: ClientRole = req.query.role === 'desktop' ? 'desktop' : 'mobile';
+    if (!cleanRoom) {
+      res.status(400).json({ error: 'Invalid room code' });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const peer: PeerClient = {
+      id: `sse-${++peerSeq}`,
+      transport: 'sse',
+      sseRes: res,
+      roomId: null,
+      role: null,
+    };
+
+    joinPeerToRoom(peer, cleanRoom, role);
+
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(': keepalive\n\n');
+      }
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      removeFromRoom(peer);
+    });
+  });
+
+  // HTTP POST fallback endpoint to relay mouse commands (works even when WS is unavailable)
+  app.post('/api/room/:roomId/cmd', (req, res) => {
+    const cleanRoom = sanitizeRoomId(String(req.params.roomId || ''));
+    if (!cleanRoom) {
+      res.status(400).json({ error: 'Invalid room code' });
+      return;
+    }
+    const body = req.body as { commands?: unknown[]; command?: unknown };
+    const list = Array.isArray(body?.commands)
+      ? body.commands
+      : body?.command
+      ? [body.command]
+      : body && typeof body === 'object' && 'type' in body
+      ? [body]
+      : [];
+
+    let delivered = 0;
+    for (const cmd of list) {
+      if (!cmd || typeof cmd !== 'object') continue;
+      delivered += relayCommandToDesktops(cleanRoom, JSON.stringify(cmd));
+    }
+
+    const members = rooms.get(cleanRoom);
+    let desktopCount = 0;
+    let mobileCount = 0;
+    if (members) {
+      for (const m of members) {
+        if (m.role === 'desktop') desktopCount += 1;
+        if (m.role === 'mobile') mobileCount += 1;
+      }
+    }
+
+    res.json({ ok: true, delivered, desktopCount, mobileCount });
   });
 
   app.get('/api/desktop-bridge/hotspot', (req, res) => {
@@ -427,7 +573,13 @@ async function startServer() {
   });
 
   wss.on('connection', (ws) => {
-    const peer: PeerClient = { ws, roomId: null, role: null };
+    const peer: PeerClient = {
+      id: `ws-${++peerSeq}`,
+      transport: 'ws',
+      ws,
+      roomId: null,
+      role: null,
+    };
 
     ws.on('message', (data) => {
       let msg: ClientToServerMessage;
@@ -438,51 +590,18 @@ async function startServer() {
       }
 
       if (msg.type === 'ping') {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'pong', ts: msg.ts } satisfies ServerToClientMessage));
-        }
+        sendToPeer(peer, JSON.stringify({ type: 'pong', ts: msg.ts } satisfies ServerToClientMessage));
         return;
       }
 
       if (msg.type === 'join') {
-        const cleanRoom = sanitizeRoomId(msg.roomId || '');
-        if (!cleanRoom) return;
-        removeFromRoom(peer);
-        peer.roomId = cleanRoom;
-        peer.role = msg.role === 'desktop' ? 'desktop' : 'mobile';
-
-        let members = rooms.get(cleanRoom);
-        if (!members) {
-          members = new Set();
-          rooms.set(cleanRoom, members);
-        }
-
-        // If a different mobile scans the laptop QR, hand active mouse control to the newly scanned phone
-        if (peer.role === 'mobile') {
-          for (const existing of Array.from(members)) {
-            if (existing !== peer && existing.role === 'mobile') {
-              members.delete(existing);
-              existing.roomId = null;
-            }
-          }
-        }
-
-        members.add(peer);
-        broadcastRoomStatus(cleanRoom);
+        joinPeerToRoom(peer, msg.roomId || '', msg.role === 'desktop' ? 'desktop' : 'mobile');
         return;
       }
 
-      // Route mouse commands immediately to desktop peers in the same room
+      // Route mouse commands immediately to desktop peers in the same room (both WS and SSE peers)
       if (!peer.roomId) return;
-      const members = rooms.get(peer.roomId);
-      if (!members) return;
-
-      const serialized = JSON.stringify(msg);
-      for (const target of members) {
-        if (target !== peer && target.role === 'desktop' && target.ws.readyState === WebSocket.OPEN) {
-          target.ws.send(serialized);
-        }
-      }
+      relayCommandToDesktops(peer.roomId, JSON.stringify(msg), peer);
     });
 
     ws.on('close', () => {

@@ -29,6 +29,7 @@ export type ServerToClientMessage =
 
 export interface MousePreferences {
   roomId: string;
+  relayOrigin: string;
   connectionMode: ConnectionMode;
   lanUrl: string;
   touchSensitivity: number;

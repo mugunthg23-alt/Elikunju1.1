@@ -8,29 +8,49 @@ interface UsePhoneMotionOptions {
   onMove: (dx: number, dy: number) => void;
 }
 
-interface DeviceMotionEventiOS extends DeviceMotionEvent {
-  requestPermission?: () => Promise<'granted' | 'denied'>;
-}
-
-interface DeviceOrientationEventiOS extends DeviceOrientationEvent {
-  requestPermission?: () => Promise<'granted' | 'denied'>;
+export function requiresExplicitMotionPermission(): boolean {
+  if (typeof window === 'undefined') return false;
+  const DME = window.DeviceMotionEvent as unknown as {
+    requestPermission?: () => Promise<'granted' | 'denied'>;
+  };
+  return Boolean(DME && typeof DME.requestPermission === 'function');
 }
 
 export function usePhoneMotion({ enabled, sensitivity, onMove }: UsePhoneMotionOptions) {
   const [motionState, setMotionState] = useState<MotionPermissionState>('idle');
+  const [receivingSensorData, setReceivingSensorData] = useState(false);
+
   const onMoveRef = useRef(onMove);
   onMoveRef.current = onMove;
 
   const sensitivityRef = useRef(sensitivity);
   sensitivityRef.current = sensitivity;
 
-  // Low-pass & drift-damping state for smooth physical phone movement
-  const smoothRef = useRef({ vx: 0, vy: 0, lastTs: 0, biasAx: 0, biasAy: 0 });
+  // Low-pass gravity estimator + damped linear velocity state for smooth physical phone movement
+  const smoothRef = useRef({
+    vx: 0,
+    vy: 0,
+    lastTs: 0,
+    biasAx: 0,
+    biasAy: 0,
+    gravX: 0,
+    gravY: 0,
+    gravInit: false,
+  });
   const lastOrientationRef = useRef<{ alpha: number; beta: number; gamma: number } | null>(null);
-  const receivedMotionRef = useRef(false);
+  const hasNonZeroGyroRef = useRef(false);
 
   const recenter = useCallback(() => {
-    smoothRef.current = { vx: 0, vy: 0, lastTs: 0, biasAx: 0, biasAy: 0 };
+    smoothRef.current = {
+      vx: 0,
+      vy: 0,
+      lastTs: 0,
+      biasAx: 0,
+      biasAy: 0,
+      gravX: 0,
+      gravY: 0,
+      gravInit: false,
+    };
     lastOrientationRef.current = null;
   }, []);
 
@@ -74,17 +94,29 @@ export function usePhoneMotion({ enabled, sensitivity, onMove }: UsePhoneMotionO
   useEffect(() => {
     if (!enabled) {
       recenter();
+      setReceivingSensorData(false);
       setMotionState((prev) => (prev === 'active' ? 'idle' : prev));
       return;
     }
 
-    if (typeof window === 'undefined' || (!('DeviceMotionEvent' in window) && !('DeviceOrientationEvent' in window))) {
+    if (
+      typeof window === 'undefined' ||
+      (!('DeviceMotionEvent' in window) && !('DeviceOrientationEvent' in window))
+    ) {
       setMotionState('unsupported');
       return;
     }
 
-    receivedMotionRef.current = false;
+    hasNonZeroGyroRef.current = false;
     setMotionState('active');
+
+    let markedReceiving = false;
+    const markSensorAlive = () => {
+      if (!markedReceiving) {
+        markedReceiving = true;
+        setReceivingSensorData(true);
+      }
+    };
 
     const handleDeviceMotion = (e: DeviceMotionEvent) => {
       const now = performance.now();
@@ -94,74 +126,110 @@ export function usePhoneMotion({ enabled, sensitivity, onMove }: UsePhoneMotionO
 
       const rot = e.rotationRate;
       const acc = e.acceleration;
+      const accG = e.accelerationIncludingGravity;
 
       let dx = 0;
       let dy = 0;
 
-      // 1) Gyroscope air-mouse / wrist rotation (lowest latency & zero gravity drift)
+      // 1) Gyroscope air-mouse / wrist rotation (only disable orientation fallback when gyro actually drives cursor)
       if (rot && (rot.alpha !== null || rot.beta !== null || rot.gamma !== null)) {
-        receivedMotionRef.current = true;
-        const yaw = rot.gamma ?? rot.alpha ?? 0; // left/right pan
-        const pitch = rot.beta ?? 0; // up/down tilt
+        const rawAlpha = rot.alpha ?? 0;
+        const rawBeta = rot.beta ?? 0;
+        const rawGamma = rot.gamma ?? 0;
 
-        const deadzoneDeg = 3.5;
+        // Combine gamma (roll/wrist tilt) and alpha (yaw pan) so both flat-table turning and air-pointing work naturally
+        const yaw = rawGamma * 0.7 + -rawAlpha * 0.65;
+        const pitch = rawBeta;
+
+        const deadzoneDeg = 0.65;
         const cleanYaw = Math.abs(yaw) > deadzoneDeg ? yaw : 0;
         const cleanPitch = Math.abs(pitch) > deadzoneDeg ? pitch : 0;
 
-        dx += cleanYaw * dt * 14 * sensitivityRef.current;
-        dy += -cleanPitch * dt * 14 * sensitivityRef.current;
+        if (cleanYaw !== 0 || cleanPitch !== 0) {
+          hasNonZeroGyroRef.current = true;
+          markSensorAlive();
+          dx += cleanYaw * dt * 18 * sensitivityRef.current;
+          dy += -cleanPitch * dt * 18 * sensitivityRef.current;
+        }
       }
 
-      // 2) Linear acceleration for sliding phone flat like a physical desk mouse
-      if (acc && acc.x !== null && acc.y !== null) {
-        receivedMotionRef.current = true;
-        // Slowly adapt static sensor bias when nearly still
-        if (Math.abs(acc.x) < 0.25) s.biasAx = s.biasAx * 0.92 + acc.x * 0.08;
-        if (Math.abs(acc.y) < 0.25) s.biasAy = s.biasAy * 0.92 + acc.y * 0.08;
+      // 2) Linear acceleration (prefer hardware e.acceleration, fall back to high-pass filtered e.accelerationIncludingGravity)
+      let rawAx: number | null = null;
+      let rawAy: number | null = null;
 
-        const ax = acc.x - s.biasAx;
-        const ay = acc.y - s.biasAy;
+      if (acc && acc.x !== null && acc.y !== null && (Math.abs(acc.x) > 0.001 || Math.abs(acc.y) > 0.001)) {
+        rawAx = acc.x;
+        rawAy = acc.y;
+      } else if (accG && accG.x !== null && accG.y !== null) {
+        if (!s.gravInit) {
+          s.gravX = accG.x;
+          s.gravY = accG.y;
+          s.gravInit = true;
+        } else {
+          // Low-pass filter isolates gravity; subtracting gives clean linear hand movement
+          s.gravX = s.gravX * 0.88 + accG.x * 0.12;
+          s.gravY = s.gravY * 0.88 + accG.y * 0.12;
+          rawAx = accG.x - s.gravX;
+          rawAy = accG.y - s.gravY;
+        }
+      }
 
-        const accDeadzone = 0.28;
+      if (rawAx !== null && rawAy !== null) {
+        markSensorAlive();
+        if (Math.abs(rawAx) < 0.2) s.biasAx = s.biasAx * 0.92 + rawAx * 0.08;
+        if (Math.abs(rawAy) < 0.2) s.biasAy = s.biasAy * 0.92 + rawAy * 0.08;
+
+        const ax = rawAx - s.biasAx;
+        const ay = rawAy - s.biasAy;
+
+        const accDeadzone = 0.16;
         const fx = Math.abs(ax) > accDeadzone ? ax : 0;
         const fy = Math.abs(ay) > accDeadzone ? ay : 0;
 
-        // Damped velocity integration prevents runaway cursor drift
-        s.vx = s.vx * 0.72 + fx * dt * 190 * sensitivityRef.current;
-        s.vy = s.vy * 0.72 + -fy * dt * 190 * sensitivityRef.current;
+        // Damped velocity integration prevents runaway cursor drift while remaining responsive on flat surfaces
+        s.vx = s.vx * 0.72 + fx * dt * 230 * sensitivityRef.current;
+        s.vy = s.vy * 0.72 + -fy * dt * 230 * sensitivityRef.current;
 
-        if (Math.abs(s.vx) < 0.2) s.vx = 0;
-        if (Math.abs(s.vy) < 0.2) s.vy = 0;
+        if (Math.abs(s.vx) < 0.15) s.vx = 0;
+        if (Math.abs(s.vy) < 0.15) s.vy = 0;
 
-        dx += s.vx * dt * 28;
-        dy += s.vy * dt * 28;
+        dx += s.vx * dt * 32;
+        dy += s.vy * dt * 32;
       }
 
-      if (Math.abs(dx) > 0.25 || Math.abs(dy) > 0.25) {
+      if (Math.abs(dx) > 0.18 || Math.abs(dy) > 0.18) {
         onMoveRef.current(dx, dy);
       }
     };
 
-    // Fallback to orientation deltas if DeviceMotion provides nulls
+    // Orientation fallback stays active whenever hardware gyroscope isn't emitting non-zero rotationRate
     const handleOrientation = (e: DeviceOrientationEvent) => {
-      if (receivedMotionRef.current) return;
-      if (e.alpha === null || e.beta === null || e.gamma === null) return;
+      if (hasNonZeroGyroRef.current) return;
+      if (e.alpha === null && e.beta === null && e.gamma === null) return;
+
+      markSensorAlive();
+      const alpha = e.alpha ?? 0;
+      const beta = e.beta ?? 0;
+      const gamma = e.gamma ?? 0;
 
       const prev = lastOrientationRef.current;
-      lastOrientationRef.current = { alpha: e.alpha, beta: e.beta, gamma: e.gamma };
+      lastOrientationRef.current = { alpha, beta, gamma };
       if (!prev) return;
 
-      let dAlpha = e.alpha - prev.alpha;
+      let dAlpha = alpha - prev.alpha;
       if (dAlpha > 180) dAlpha -= 360;
       if (dAlpha < -180) dAlpha += 360;
 
-      const dBeta = e.beta - prev.beta;
-      const dGamma = e.gamma - prev.gamma;
+      const dBeta = beta - prev.beta;
+      const dGamma = gamma - prev.gamma;
 
-      const dx = (-dAlpha * 0.7 + dGamma * 0.5) * 6 * sensitivityRef.current;
-      const dy = -dBeta * 6 * sensitivityRef.current;
+      // Ignore wild compass jumps (>35 deg in one tick)
+      if (Math.abs(dAlpha) > 35 || Math.abs(dBeta) > 35 || Math.abs(dGamma) > 35) return;
 
-      if (Math.abs(dx) > 0.35 || Math.abs(dy) > 0.35) {
+      const dx = (-dAlpha * 0.65 + dGamma * 0.85) * 8.5 * sensitivityRef.current;
+      const dy = -dBeta * 8.5 * sensitivityRef.current;
+
+      if (Math.abs(dx) > 0.25 || Math.abs(dy) > 0.25) {
         onMoveRef.current(dx, dy);
       }
     };
@@ -177,9 +245,8 @@ export function usePhoneMotion({ enabled, sensitivity, onMove }: UsePhoneMotionO
 
   return {
     motionState,
+    receivingSensorData,
     requestMotionPermission,
     recenter,
   };
 }
-
-export type { DeviceMotionEventiOS, DeviceOrientationEventiOS };

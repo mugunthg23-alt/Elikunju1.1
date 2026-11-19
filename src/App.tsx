@@ -3,13 +3,13 @@ import { QrCode, Wifi } from 'lucide-react';
 import { MouseController } from './components/MouseController';
 import { ConnectionDrawer } from './components/ConnectionDrawer';
 import { DesktopReceiver } from './components/DesktopReceiver';
-import { QRScannerModal } from './components/QRScannerModal';
+import { QRScannerModal, type ScannedQRTarget } from './components/QRScannerModal';
 import { useMouseSocket } from './hooks/useMouseSocket';
-import { usePhoneMotion } from './hooks/usePhoneMotion';
+import { requiresExplicitMotionPermission, usePhoneMotion } from './hooks/usePhoneMotion';
 import { useOnlineStatus } from './hooks/usePWAInstall';
 import type { ClientRole, MouseCommand, MousePreferences } from './types/mouse';
 
-const STORAGE_KEY = 'pocketmouse_prefs_v1';
+const STORAGE_KEY = 'pocketmouse_prefs_v2';
 const GUIDE_SEEN_KEY = 'pocketmouse_gesture_guide_seen_v1';
 const GUIDE_DURATION_MS = 4000;
 
@@ -20,16 +20,18 @@ function generateRoomCode(): string {
 function loadInitialPreferences(): MousePreferences {
   const params = new URLSearchParams(window.location.search);
   const urlRoom = params.get('room')?.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8);
+  const autoMotion = !requiresExplicitMotionPermission();
 
   const defaults: MousePreferences = {
     roomId: urlRoom || generateRoomCode(),
+    relayOrigin: '',
     connectionMode: 'relay',
     lanUrl: '',
     touchSensitivity: 1.6,
     motionSensitivity: 1.5,
-    scrollSensitivity: 1.2,
+    scrollSensitivity: 1.3,
     naturalScroll: false,
-    motionEnabled: false,
+    motionEnabled: autoMotion,
     hapticsEnabled: true,
   };
 
@@ -41,6 +43,7 @@ function loadInitialPreferences(): MousePreferences {
       ...defaults,
       ...parsed,
       connectionMode: urlRoom ? 'relay' : parsed.connectionMode || 'relay',
+      relayOrigin: urlRoom ? '' : parsed.relayOrigin || '',
       roomId: urlRoom || parsed.roomId || defaults.roomId,
     };
   } catch {
@@ -50,7 +53,17 @@ function loadInitialPreferences(): MousePreferences {
 
 function loadInitialRole(): ClientRole {
   const params = new URLSearchParams(window.location.search);
-  return params.get('mode') === 'desktop' ? 'desktop' : 'mobile';
+  const explicitMode = params.get('mode');
+  if (explicitMode === 'desktop') return 'desktop';
+  if (explicitMode === 'mobile' || params.get('room')) return 'mobile';
+
+  // On laptops/desktops with a mouse pointer and wide screen, open directly to Laptop QR View so mobile can scan immediately.
+  // On mobile phones/tablets, always open directly to the pure Mouse controller screen.
+  const isDesktopScreen =
+    typeof window !== 'undefined' &&
+    window.innerWidth >= 1024 &&
+    window.matchMedia?.('(pointer: fine)').matches;
+  return isDesktopScreen ? 'desktop' : 'mobile';
 }
 
 export default function App() {
@@ -59,6 +72,16 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [lanAddresses, setLanAddresses] = useState<string[]>([]);
+  const [pairNotice, setPairNotice] = useState<{ text: string; tone: 'pending' | 'ok' | 'warn' } | null>(null);
+  const pairNoticeTimerRef = useRef<number | null>(null);
+  const recentlyScannedRoomRef = useRef<string | null>(
+    (() => {
+      const params = new URLSearchParams(window.location.search);
+      const urlRoom = params.get('room')?.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 8);
+      return urlRoom || null;
+    })()
+  );
+
   const [showGuide, setShowGuide] = useState<boolean>(() => {
     try {
       return !window.localStorage.getItem(GUIDE_SEEN_KEY);
@@ -91,6 +114,20 @@ export default function App() {
     }, GUIDE_DURATION_MS);
   }, [dismissGuide]);
 
+  const showTransientNotice = useCallback((text: string, tone: 'pending' | 'ok' | 'warn', durationMs: number) => {
+    if (pairNoticeTimerRef.current !== null) {
+      window.clearTimeout(pairNoticeTimerRef.current);
+      pairNoticeTimerRef.current = null;
+    }
+    setPairNotice({ text, tone });
+    if (durationMs > 0) {
+      pairNoticeTimerRef.current = window.setTimeout(() => {
+        setPairNotice(null);
+        pairNoticeTimerRef.current = null;
+      }, durationMs);
+    }
+  }, []);
+
   useEffect(() => {
     if (role !== 'mobile' || !showGuide) return;
     guideTimerRef.current = window.setTimeout(() => {
@@ -103,6 +140,14 @@ export default function App() {
       }
     };
   }, [role, showGuide, dismissGuide]);
+
+  useEffect(() => {
+    return () => {
+      if (pairNoticeTimerRef.current !== null) {
+        window.clearTimeout(pairNoticeTimerRef.current);
+      }
+    };
+  }, []);
 
   const isOnline = useOnlineStatus();
   const desktopCommandHandlerRef = useRef<((cmd: MouseCommand) => void) | null>(null);
@@ -130,26 +175,40 @@ export default function App() {
   useEffect(() => {
     let active = true;
     fetch('/api/network-info')
-      .then((res) => (res.ok ? res.json() : null))
+      .then((res) => {
+        const ct = res.headers.get('content-type') || '';
+        return res.ok && ct.includes('application/json') ? res.json() : null;
+      })
       .then((data: { lanAddresses?: string[] } | null) => {
         if (!active || !data?.lanAddresses) return;
         setLanAddresses(data.lanAddresses);
       })
       .catch(() => {
-        // Ignore offline network-info lookup
+        // Static hosting (e.g. Netlify) has no /api/network-info route — ignore cleanly
       });
     return () => {
       active = false;
     };
   }, []);
 
-  const { status, peerCounts, latencyMs, errorDetail, sendCommand } = useMouseSocket({
+  const { status, transport, peerCounts, latencyMs, errorDetail, sendCommand } = useMouseSocket({
     role,
     roomId: preferences.roomId,
+    relayOrigin: role === 'mobile' ? preferences.relayOrigin : '',
     connectionMode: preferences.connectionMode,
     lanUrl: preferences.lanUrl,
     onCommand: handleIncomingCommand,
   });
+
+  // Show truthful live pairing confirmation ONLY right after scanning/joining a room, then auto-fade completely
+  useEffect(() => {
+    if (role !== 'mobile' || !recentlyScannedRoomRef.current) return;
+    if (status === 'connected' && peerCounts.desktop > 0) {
+      const room = recentlyScannedRoomRef.current;
+      recentlyScannedRoomRef.current = null;
+      showTransientNotice(`Paired with Laptop · Room ${room}`, 'ok', 2200);
+    }
+  }, [role, status, peerCounts.desktop, showTransientNotice]);
 
   const handleMotionMove = useCallback(
     (dx: number, dy: number) => {
@@ -178,22 +237,57 @@ export default function App() {
     [requestMotionPermission, updatePreferences]
   );
 
+  const handleOpenScanner = useCallback(() => {
+    if (showGuide) dismissGuide();
+    // On iOS Safari, tapping the Scan button is a valid user gesture to unlock physical phone motion too
+    if (requiresExplicitMotionPermission() && !preferences.motionEnabled) {
+      void requestMotionPermission().then((granted) => {
+        if (granted) {
+          updatePreferences({ motionEnabled: true });
+        }
+      });
+    }
+    setScannerOpen(true);
+  }, [showGuide, dismissGuide, preferences.motionEnabled, requestMotionPermission, updatePreferences]);
+
   const handleScannedRoom = useCallback(
-    (roomId: string) => {
-      updatePreferences({ roomId, connectionMode: 'relay' });
+    ({ roomId, relayOrigin }: ScannedQRTarget) => {
+      recentlyScannedRoomRef.current = roomId;
+      updatePreferences({
+        roomId,
+        relayOrigin,
+        connectionMode: 'relay',
+        motionEnabled: !requiresExplicitMotionPermission() ? true : preferences.motionEnabled,
+      });
       setRole('mobile');
       setScannerOpen(false);
       setDrawerOpen(false);
+      showTransientNotice(`Linking to Laptop · Room ${roomId}…`, 'pending', 4200);
+
+      // If laptop peer hasn't responded after 4.2s, inform the user clearly instead of staying silent
+      window.setTimeout(() => {
+        if (recentlyScannedRoomRef.current === roomId) {
+          recentlyScannedRoomRef.current = null;
+          showTransientNotice(
+            `Keep Laptop QR View open on Room ${roomId}`,
+            'warn',
+            3800
+          );
+        }
+      }, 4200);
     },
-    [updatePreferences]
+    [updatePreferences, preferences.motionEnabled, showTransientNotice]
   );
 
   if (role === 'desktop') {
     return (
       <DesktopReceiver
         roomId={preferences.roomId}
-        onRefreshRoom={() => updatePreferences({ roomId: generateRoomCode(), connectionMode: 'relay' })}
+        onRefreshRoom={() =>
+          updatePreferences({ roomId: generateRoomCode(), relayOrigin: '', connectionMode: 'relay' })
+        }
         socketStatus={status}
+        transport={transport}
         mobileCount={peerCounts.mobile}
         latencyMs={latencyMs}
         lanAddresses={lanAddresses}
@@ -212,6 +306,23 @@ export default function App() {
         onDismissGuide={dismissGuide}
       />
 
+      {/* Momentary pairing status toast shown ONLY immediately after scanning a laptop QR */}
+      {pairNotice && (
+        <div
+          role="status"
+          className={`pointer-events-none fixed left-1/2 top-4 z-40 -translate-x-1/2 rounded-xl px-3.5 py-2 text-xs font-medium shadow-lg whitespace-nowrap transition-opacity duration-300 ${
+            pairNotice.tone === 'ok'
+              ? 'bg-emerald-500/95 text-[#08131A]'
+              : pairNotice.tone === 'warn'
+              ? 'bg-amber-400/95 text-[#101827]'
+              : 'bg-slate-800/95 text-slate-100 border border-slate-700'
+          }`}
+          style={{ marginTop: 'env(safe-area-inset-top, 0px)' }}
+        >
+          {pairNotice.text}
+        </div>
+      )}
+
       {/* Quiet top-right corner actions: 1-tap Scan Laptop QR + Settings/Wi-Fi */}
       <div
         className="fixed right-3 top-3 z-30 flex items-center gap-1"
@@ -219,10 +330,7 @@ export default function App() {
       >
         <button
           type="button"
-          onClick={() => {
-            if (showGuide) dismissGuide();
-            setScannerOpen(true);
-          }}
+          onClick={handleOpenScanner}
           aria-label="Scan laptop QR code"
           className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-slate-300/40 transition-opacity duration-150 hover:text-slate-100 hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-[#C78E65]"
         >
@@ -256,10 +364,13 @@ export default function App() {
         onClose={() => setDrawerOpen(false)}
         onOpenScanner={() => {
           setDrawerOpen(false);
-          setScannerOpen(true);
+          handleOpenScanner();
         }}
         role={role}
         onRoleChange={(nextRole) => {
+          if (nextRole === 'desktop') {
+            updatePreferences({ relayOrigin: '' });
+          }
           setRole(nextRole);
           setDrawerOpen(false);
         }}
