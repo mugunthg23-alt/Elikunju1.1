@@ -13,6 +13,9 @@ interface RippleFeedback {
 interface MouseControllerProps {
   preferences: MousePreferences;
   onCommand: (cmd: MouseCommand) => void;
+  onTouchGlideChange?: (gliding: boolean) => void;
+  onTapImpact?: () => void;
+  onFirstInteraction?: () => void;
   showGuide?: boolean;
   onDismissGuide?: () => void;
 }
@@ -31,15 +34,20 @@ const BODY_RX = 158;
 const BODY_RY = 104;
 const NECK_Y = 286;
 
-const TAP_MAX_DIST = 14;
+const CANVAS_MOVE_DEADZONE = 2.5;
+const BODY_MOVE_DEADZONE = 8;
 const HEAD_SCROLL_DEADZONE = 2.5;
-const TAP_MAX_MS = 380;
-const DOUBLE_TAP_MS = 310;
+const TAP_MAX_DIST = 8;
+const TAP_MAX_MS = 340;
+const DOUBLE_TAP_MS = 300;
 const HOLD_DRAG_MS = 420;
 
 export const MouseController: React.FC<MouseControllerProps> = ({
   preferences,
   onCommand,
+  onTouchGlideChange,
+  onTapImpact,
+  onFirstInteraction,
   showGuide = false,
   onDismissGuide,
 }) => {
@@ -77,6 +85,8 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     twoFingerMoved: boolean;
     twoFingerLastY: number;
     twoFingerStartTime: number;
+    smoothDx: number;
+    smoothDy: number;
   }>({
     pointerId: null,
     zone: 'canvas',
@@ -92,6 +102,8 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     twoFingerMoved: false,
     twoFingerLastY: 0,
     twoFingerStartTime: 0,
+    smoothDx: 0,
+    smoothDy: 0,
   });
 
   const vibrate = useCallback(
@@ -186,6 +198,8 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     if (showGuide) {
       onDismissGuide?.();
     }
+    onFirstInteraction?.();
+    onTapImpact?.();
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
@@ -224,6 +238,8 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     g.startTime = performance.now();
     g.moved = false;
     g.draggingButton = null;
+    g.smoothDx = 0;
+    g.smoothDy = 0;
 
     setActiveZone(zone);
 
@@ -256,6 +272,7 @@ export const MouseController: React.FC<MouseControllerProps> = ({
       g.twoFingerLastY = avgY;
       if (Math.abs(dy) > 1.2) {
         g.twoFingerMoved = true;
+        onTouchGlideChange?.(true);
         const sign = preferences.naturalScroll ? -1 : 1;
         onCommand({
           type: 'scroll',
@@ -275,10 +292,17 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     g.lastY = e.clientY;
 
     const totalDist = Math.hypot(e.clientX - g.startX, e.clientY - g.startY);
-    const moveThreshold = g.zone === 'head' ? HEAD_SCROLL_DEADZONE : TAP_MAX_DIST;
+    const moveThreshold =
+      g.zone === 'head'
+        ? HEAD_SCROLL_DEADZONE
+        : g.zone === 'canvas'
+        ? CANVAS_MOVE_DEADZONE
+        : BODY_MOVE_DEADZONE;
+
     if (totalDist > moveThreshold && !g.moved) {
       g.moved = true;
       clearHoldTimer();
+      onTouchGlideChange?.(true);
     }
 
     if (!g.moved && !g.draggingButton) return;
@@ -286,8 +310,8 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     // Mouse head acts strictly as an instant, responsive tactile scroll bar
     if (g.zone === 'head') {
       const sign = preferences.naturalScroll ? -1 : 1;
-      const scrollDx = rawDx * sign * preferences.scrollSensitivity * 0.6;
-      const scrollDy = rawDy * sign * preferences.scrollSensitivity * 1.05;
+      const scrollDx = rawDx * sign * preferences.scrollSensitivity * 0.55;
+      const scrollDy = rawDy * sign * preferences.scrollSensitivity * 0.95;
       if (Math.abs(scrollDx) > 0.08 || Math.abs(scrollDy) > 0.08) {
         onCommand({ type: 'scroll', dx: scrollDx, dy: scrollDy });
         flashScrollIndicator(rawDy);
@@ -295,11 +319,21 @@ export const MouseController: React.FC<MouseControllerProps> = ({
       return;
     }
 
-    // Touchpad cursor movement (with gentle pointer acceleration curve)
-    const speed = Math.hypot(rawDx, rawDy);
-    const accel = 1 + Math.min(speed / 22, 1.35);
-    const dx = rawDx * preferences.touchSensitivity * accel;
-    const dy = rawDy * preferences.touchSensitivity * accel;
+    // Precision laptop-trackpad response curve:
+    // slow finger glide = steady 1:1 aiming for tiny buttons; fast swipe = crosses full 1920px laptop screen in one stroke
+    g.smoothDx = g.smoothDx * 0.24 + rawDx * 0.76;
+    g.smoothDy = g.smoothDy * 0.24 + rawDy * 0.76;
+
+    const speed = Math.hypot(g.smoothDx, g.smoothDy);
+    const accel =
+      speed < 2.5
+        ? 0.95
+        : speed < 10
+        ? 1.05 + (speed - 2.5) * 0.14
+        : Math.min(3.8, 2.1 + (speed - 10) * 0.09);
+
+    const dx = g.smoothDx * preferences.touchSensitivity * accel;
+    const dy = g.smoothDy * preferences.touchSensitivity * accel;
 
     if (Math.abs(dx) > 0.05 || Math.abs(dy) > 0.05) {
       onCommand({ type: 'move', dx, dy, source: 'touch' });
@@ -321,17 +355,23 @@ export const MouseController: React.FC<MouseControllerProps> = ({
     if (g.pointerId !== e.pointerId) {
       if (pointersRef.current.size === 0) {
         setActiveZone(null);
+        onTouchGlideChange?.(false);
       }
       return;
     }
 
     clearHoldTimer();
 
+    const totalDist = Math.hypot(e.clientX - g.startX, e.clientY - g.startY);
+    // Strictly never fire a click if the cursor already started gliding
+    const isQuickTap = !cancelled && !g.moved && totalDist <= TAP_MAX_DIST && performance.now() - g.startTime <= TAP_MAX_MS;
+
     if (g.draggingButton) {
       onCommand({ type: 'up', button: g.draggingButton });
       g.draggingButton = null;
       setHoldingButton(null);
-    } else if (!cancelled && !g.moved && performance.now() - g.startTime <= TAP_MAX_MS) {
+      onTapImpact?.();
+    } else if (isQuickTap) {
       if (g.zone === 'left' || g.zone === 'right') {
         const btn: MouseButton = g.zone;
         const now = performance.now();
@@ -346,12 +386,14 @@ export const MouseController: React.FC<MouseControllerProps> = ({
           vibrate(btn === 'left' ? 12 : [10, 22, 10]);
         }
         spawnRipple(e.clientX, e.clientY, btn);
+        onTapImpact?.();
       }
     }
 
     g.pointerId = null;
     if (pointersRef.current.size === 0) {
       setActiveZone(null);
+      onTouchGlideChange?.(false);
     }
   };
 

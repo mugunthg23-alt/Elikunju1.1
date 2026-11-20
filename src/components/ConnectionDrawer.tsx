@@ -3,6 +3,8 @@ import {
   ChevronDown,
   Download,
   Laptop,
+  Maximize2,
+  Minimize2,
   Move,
   QrCode,
   RefreshCw,
@@ -15,6 +17,7 @@ import type { MotionPermissionState } from '../hooks/usePhoneMotion';
 import {
   buildClientNodeBridgeScript,
   buildClientPythonBridgeScript,
+  buildClientWindowsBatBridgeScript,
   triggerTextFileDownload,
 } from '../lib/bridgeScripts';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -57,10 +60,47 @@ export const ConnectionDrawer: React.FC<ConnectionDrawerProps> = ({
   lanAddresses,
 }) => {
   const [roomInput, setRoomInput] = useState(preferences.roomId);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   useEffect(() => {
     setRoomInput(preferences.roomId);
   }, [preferences.roomId]);
+
+  useEffect(() => {
+    const syncFs = () => {
+      const doc = document as Document & { webkitFullscreenElement?: Element | null };
+      setIsFullscreen(Boolean(doc.fullscreenElement || doc.webkitFullscreenElement));
+    };
+    syncFs();
+    document.addEventListener('fullscreenchange', syncFs);
+    document.addEventListener('webkitfullscreenchange', syncFs);
+    return () => {
+      document.removeEventListener('fullscreenchange', syncFs);
+      document.removeEventListener('webkitfullscreenchange', syncFs);
+    };
+  }, []);
+
+  const handleToggleFullscreen = async () => {
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void> | void;
+    };
+    const root = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void> | void;
+    };
+    try {
+      if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+        if (doc.exitFullscreen) await doc.exitFullscreen();
+        else if (doc.webkitExitFullscreen) await doc.webkitExitFullscreen();
+      } else {
+        if (root.requestFullscreen) await root.requestFullscreen();
+        else if (root.webkitRequestFullscreen) await root.webkitRequestFullscreen();
+      }
+    } catch {
+      // Some iOS Safari versions require Add to Home Screen for full screen
+    }
+    onClose();
+  };
 
   if (!open) return null;
 
@@ -356,6 +396,20 @@ export const ConnectionDrawer: React.FC<ConnectionDrawerProps> = ({
                   Local IP: <span className="font-mono-num text-slate-300">{lanAddresses[0]}</span>
                 </p>
               )}
+              <button
+                type="button"
+                onClick={() =>
+                  triggerTextFileDownload(
+                    `eli-kunju-laptop-${preferences.roomId}.bat`,
+                    buildClientWindowsBatBridgeScript(preferences.roomId),
+                    'application/x-msdos-program;charset=utf-8'
+                  )
+                }
+                className="inline-flex w-full min-h-[42px] items-center justify-center gap-2 rounded-xl bg-[#C78E65] px-3 text-xs font-semibold text-[#101827] hover:bg-[#D59E76] whitespace-nowrap transition-colors"
+              >
+                <Download className="w-3.5 h-3.5 shrink-0" />
+                <span>Windows Full Laptop Mouse (.bat — No Install)</span>
+              </button>
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
@@ -386,14 +440,19 @@ export const ConnectionDrawer: React.FC<ConnectionDrawerProps> = ({
                   <span>Node.js (.mjs)</span>
                 </button>
               </div>
-              <p className="font-mono-num text-[11px] text-slate-400">
-                Works on Netlify: <span className="text-slate-200">python eli-kunju-bridge.py</span>
-              </p>
             </div>
           </details>
 
-          {/* PWA Install Button */}
-          <div className="pt-1">
+          {/* Full Screen & PWA Install Actions */}
+          <div className="space-y-2.5 pt-1">
+            <button
+              type="button"
+              onClick={() => void handleToggleFullscreen()}
+              className="inline-flex w-full min-h-[44px] items-center justify-center gap-2 rounded-xl border border-slate-700 bg-[#0E1524] px-4 text-xs font-medium text-slate-100 hover:border-[#C78E65]/70 hover:bg-slate-800 whitespace-nowrap transition-colors"
+            >
+              {isFullscreen ? <Minimize2 className="w-4 h-4 shrink-0" /> : <Maximize2 className="w-4 h-4 shrink-0" />}
+              <span>{isFullscreen ? 'Exit Full Screen' : 'Enter Full Screen'}</span>
+            </button>
             <PWAInstallButton />
           </div>
         </div>

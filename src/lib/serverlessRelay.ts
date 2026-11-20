@@ -130,7 +130,7 @@ function tryParseMqttPacket(buf: Uint8Array): ParsedMqttPacket | null {
 }
 
 type PresenceMsg =
-  | { kind: 'hello'; role: ClientRole; id: string; ts: number }
+  | { kind: 'hello'; role: ClientRole; id: string; ts: number; osBridge?: boolean }
   | { kind: 'bye'; role: ClientRole; id: string }
   | { kind: 'ping'; from: string; to?: string; ts: number }
   | { kind: 'pong'; from: string; to: string; ts: number };
@@ -142,7 +142,7 @@ type RtcSignalMsg =
 
 export interface ServerlessRelayCallbacks {
   onStatus: (status: 'connecting' | 'connected' | 'disconnected') => void;
-  onPeers: (counts: { mobile: number; desktop: number }) => void;
+  onPeers: (counts: { mobile: number; desktop: number; osBridge: boolean }) => void;
   onLatency: (ms: number | null) => void;
   onCommand: (cmd: MouseCommand) => void;
   onP2PState?: (active: boolean) => void;
@@ -158,7 +158,7 @@ export class ServerlessRelayClient {
   private ws: WebSocket | null = null;
   private brokerIndex = 0;
   private closed = false;
-  private rxBuffer = new Uint8Array(0);
+  private rxBuffer: Uint8Array = new Uint8Array(0);
   private packetId = 1;
   private mqttReady = false;
 
@@ -167,16 +167,17 @@ export class ServerlessRelayClient {
   private reconnectTimer: number | null = null;
   private connectTimeoutTimer: number | null = null;
 
-  // Track active peers by clientId -> { role, lastSeen }
-  private peers = new Map<string, { role: ClientRole; lastSeen: number }>();
+  // Track active peers by clientId -> { role, lastSeen, osBridge }
+  private peers = new Map<string, { role: ClientRole; lastSeen: number; osBridge?: boolean }>();
   private activeMobileId: string | null = null;
 
-  // Optional direct WebRTC P2P DataChannel for ultra-low-latency local Wi-Fi / Mobile Hotspot control
+  // Direct WebRTC P2P DataChannel for ultra-low-latency local Wi-Fi / Mobile Hotspot control
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private rtcPeerId: string | null = null;
+  private pendingIce: RTCIceCandidateInit[] = [];
 
-  // Pace MQTT-WSS publishes (~12/s max) with multi-command batching so public brokers never rate-limit bursts
+  // Pace MQTT-WSS fallback publishes (~16/s max) with multi-command batching so public brokers never rate-limit
   private mqttOutQueue: MouseCommand[] = [];
   private mqttFlushTimer: number | null = null;
   private lastMqttPublishAt = 0;
@@ -229,8 +230,10 @@ export class ServerlessRelayClient {
   }
 
   public sendCommand(cmd: MouseCommand): void {
-    // Prefer direct WebRTC DataChannel (1-3ms local Wi-Fi / Hotspot, zero rate limits) when open
-    if (this.dc && this.dc.readyState === 'open') {
+    // When an OS bridge is running in the same room, ALWAYS send over MQTT so the OS bridge receives it too!
+    // When only browser-to-browser is active and WebRTC DataChannel is open, use direct P2P for 1-3ms latency.
+    const hasOsBridge = this.hasActiveOsBridge();
+    if (!hasOsBridge && this.dc && this.dc.readyState === 'open') {
       try {
         this.dc.send(JSON.stringify(cmd));
         return;
@@ -240,7 +243,7 @@ export class ServerlessRelayClient {
     }
     if (!this.mqttReady) return;
 
-    // Coalesce adjacent move or scroll deltas inside the pending MQTT batch to keep payloads compact
+    // Coalesce adjacent move or scroll deltas inside the pending MQTT batch to keep payloads tiny & lossless
     const last = this.mqttOutQueue[this.mqttOutQueue.length - 1];
     if (cmd.type === 'move' && last && last.type === 'move' && last.source === cmd.source) {
       last.dx = Number((last.dx + cmd.dx).toFixed(2));
@@ -262,8 +265,16 @@ export class ServerlessRelayClient {
       this.mqttFlushTimer = window.setTimeout(() => {
         this.mqttFlushTimer = null;
         this.flushMqttQueue();
-      }, Math.max(15, minIntervalMs - elapsed));
+      }, Math.max(12, minIntervalMs - elapsed));
     }
+  }
+
+  private hasActiveOsBridge(): boolean {
+    const now = Date.now();
+    for (const info of this.peers.values()) {
+      if (info.osBridge && now - info.lastSeen <= 12000) return true;
+    }
+    return false;
   }
 
   private flushMqttQueue(): void {
@@ -323,11 +334,13 @@ export class ServerlessRelayClient {
 
     let mobile = this.role === 'mobile' ? 1 : 0;
     let desktop = this.role === 'desktop' ? 1 : 0;
+    let osBridge = false;
     for (const info of this.peers.values()) {
       if (info.role === 'mobile') mobile += 1;
       if (info.role === 'desktop') desktop += 1;
+      if (info.osBridge) osBridge = true;
     }
-    this.callbacks.onPeers({ mobile, desktop });
+    this.callbacks.onPeers({ mobile, desktop, osBridge });
   }
 
   private connectNextBroker(): void {
@@ -420,7 +433,6 @@ export class ServerlessRelayClient {
       this.callbacks.onStatus('connected');
       this.callbacks.onError?.(null);
 
-      // Subscribe to room presence, commands (desktop only), and WebRTC signaling
       const topics =
         this.role === 'desktop'
           ? [this.presenceTopic, this.cmdTopic, this.rtcTopic]
@@ -428,7 +440,6 @@ export class ServerlessRelayClient {
 
       this.ws?.send(buildMqttSubscribe(this.packetId++, topics));
 
-      // Announce our presence immediately
       const announce = () => {
         if (!this.mqttReady) return;
         this.publishJson(this.presenceTopic, {
@@ -441,12 +452,10 @@ export class ServerlessRelayClient {
       };
 
       announce();
-      // Second quick announce after 450ms guarantees instant discovery right after SUBACK
       window.setTimeout(announce, 450);
 
       this.presenceTimer = window.setInterval(() => {
         announce();
-        // Ping peer to measure real end-to-end RTT
         if (this.peers.size > 0) {
           this.publishJson(this.presenceTopic, {
             kind: 'ping',
@@ -512,7 +521,11 @@ export class ServerlessRelayClient {
     if (msg.kind === 'hello') {
       if (msg.id === this.clientId) return;
       const isNewPeer = !this.peers.has(msg.id);
-      this.peers.set(msg.id, { role: msg.role, lastSeen: Date.now() });
+      this.peers.set(msg.id, {
+        role: msg.role,
+        lastSeen: Date.now(),
+        osBridge: Boolean(msg.osBridge),
+      });
 
       if (this.role === 'desktop' && msg.role === 'mobile') {
         this.activeMobileId = msg.id;
@@ -520,7 +533,6 @@ export class ServerlessRelayClient {
 
       this.updatePeerCounts();
 
-      // Immediately reply with our hello so the newly arrived peer sees us in <100ms
       if (isNewPeer) {
         this.publishJson(this.presenceTopic, {
           kind: 'hello',
@@ -530,8 +542,13 @@ export class ServerlessRelayClient {
         } satisfies PresenceMsg);
       }
 
-      // Mobile automatically initiates a direct WebRTC P2P DataChannel to the discovered desktop
-      if (this.role === 'mobile' && msg.role === 'desktop' && this.rtcPeerId !== msg.id) {
+      // Only initiate WebRTC to browser desktops (OS bridges receive directly via MQTT)
+      if (
+        this.role === 'mobile' &&
+        msg.role === 'desktop' &&
+        !msg.osBridge &&
+        this.rtcPeerId !== msg.id
+      ) {
         void this.startRtcOffer(msg.id);
       }
       return;
@@ -567,6 +584,7 @@ export class ServerlessRelayClient {
 
   private teardownRtc(): void {
     this.rtcPeerId = null;
+    this.pendingIce = [];
     if (this.dc) {
       try {
         this.dc.close();
@@ -611,6 +629,18 @@ export class ServerlessRelayClient {
     };
   }
 
+  private async flushPendingIce(): Promise<void> {
+    if (!this.pc || !this.pc.remoteDescription || this.pendingIce.length === 0) return;
+    const queued = this.pendingIce.splice(0, this.pendingIce.length);
+    for (const candidate of queued) {
+      try {
+        await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // Ignore stale ICE candidate
+      }
+    }
+  }
+
   private async startRtcOffer(targetDesktopId: string): Promise<void> {
     if (typeof RTCPeerConnection === 'undefined') return;
     this.teardownRtc();
@@ -650,7 +680,6 @@ export class ServerlessRelayClient {
         sdp: offer,
       } satisfies RtcSignalMsg);
     } catch {
-      // WebRTC is strictly an optimization; MQTT-WSS remains active as reliable transport
       this.teardownRtc();
     }
   }
@@ -683,6 +712,7 @@ export class ServerlessRelayClient {
         };
 
         await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        await this.flushPendingIce();
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
 
@@ -698,6 +728,7 @@ export class ServerlessRelayClient {
       if (msg.kind === 'answer' && this.role === 'mobile' && this.pc && this.rtcPeerId === msg.from) {
         if (this.pc.signalingState === 'have-local-offer') {
           await this.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          await this.flushPendingIce();
         }
         return;
       }
@@ -705,6 +736,8 @@ export class ServerlessRelayClient {
       if (msg.kind === 'ice' && this.pc && this.rtcPeerId === msg.from) {
         if (this.pc.remoteDescription) {
           await this.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } else {
+          this.pendingIce.push(msg.candidate);
         }
       }
     } catch {

@@ -30,6 +30,7 @@ export function useMouseSocket({
   const [status, setStatus] = useState<SocketStatus>('connecting');
   const [transport, setTransport] = useState<TransportKind>('none');
   const [peerCounts, setPeerCounts] = useState({ mobile: 0, desktop: 0 });
+  const [osBridgeConnected, setOsBridgeConnected] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
 
@@ -103,6 +104,7 @@ export function useMouseSocket({
     let retryAttempt = 0;
 
     setPeerCounts({ mobile: 0, desktop: 0 });
+    setOsBridgeConnected(false);
     setLatencyMs(null);
     setErrorDetail(null);
 
@@ -125,7 +127,8 @@ export function useMouseSocket({
         },
         onPeers: (counts) => {
           if (cancelled) return;
-          setPeerCounts(counts);
+          setPeerCounts({ mobile: counts.mobile, desktop: counts.desktop });
+          setOsBridgeConnected(counts.osBridge);
         },
         onLatency: (ms) => {
           if (cancelled) return;
@@ -277,6 +280,7 @@ export function useMouseSocket({
     status,
     transport,
     peerCounts,
+    osBridgeConnected,
     isPeerReady,
     latencyMs,
     errorDetail,

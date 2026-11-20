@@ -27,7 +27,7 @@ function loadInitialPreferences(): MousePreferences {
     relayOrigin: '',
     connectionMode: 'relay',
     lanUrl: '',
-    touchSensitivity: 1.6,
+    touchSensitivity: 1.8,
     motionSensitivity: 1.5,
     scrollSensitivity: 1.3,
     naturalScroll: false,
@@ -71,6 +71,9 @@ export default function App() {
   const [preferences, setPreferences] = useState<MousePreferences>(loadInitialPreferences);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [touchGliding, setTouchGliding] = useState(false);
+  const [tapSettleUntil, setTapSettleUntil] = useState(0);
+  const iosAutoUnlockAttemptedRef = useRef(false);
   const [lanAddresses, setLanAddresses] = useState<string[]>([]);
   const [pairNotice, setPairNotice] = useState<{ text: string; tone: 'pending' | 'ok' | 'warn' } | null>(null);
   const pairNoticeTimerRef = useRef<number | null>(null);
@@ -191,7 +194,7 @@ export default function App() {
     };
   }, []);
 
-  const { status, transport, peerCounts, latencyMs, errorDetail, sendCommand } = useMouseSocket({
+  const { status, transport, peerCounts, osBridgeConnected, latencyMs, errorDetail, sendCommand } = useMouseSocket({
     role,
     roomId: preferences.roomId,
     relayOrigin: role === 'mobile' ? preferences.relayOrigin : '',
@@ -219,9 +222,31 @@ export default function App() {
 
   const { motionState, requestMotionPermission, recenter } = usePhoneMotion({
     enabled: role === 'mobile' && preferences.motionEnabled,
+    touchGliding,
+    tapSettleUntil,
     sensitivity: preferences.motionSensitivity,
     onMove: handleMotionMove,
   });
+
+  const handleTapImpact = useCallback(() => {
+    setTapSettleUntil(performance.now() + 140);
+  }, []);
+
+  const handleFirstInteraction = useCallback(() => {
+    // On iOS Safari, automatically unlock physical phone motion on the very first touch gesture
+    if (
+      !iosAutoUnlockAttemptedRef.current &&
+      requiresExplicitMotionPermission() &&
+      !preferences.motionEnabled
+    ) {
+      iosAutoUnlockAttemptedRef.current = true;
+      void requestMotionPermission().then((granted) => {
+        if (granted) {
+          updatePreferences({ motionEnabled: true });
+        }
+      });
+    }
+  }, [preferences.motionEnabled, requestMotionPermission, updatePreferences]);
 
   const handleToggleMotion = useCallback(
     async (next: boolean) => {
@@ -239,16 +264,9 @@ export default function App() {
 
   const handleOpenScanner = useCallback(() => {
     if (showGuide) dismissGuide();
-    // On iOS Safari, tapping the Scan button is a valid user gesture to unlock physical phone motion too
-    if (requiresExplicitMotionPermission() && !preferences.motionEnabled) {
-      void requestMotionPermission().then((granted) => {
-        if (granted) {
-          updatePreferences({ motionEnabled: true });
-        }
-      });
-    }
+    handleFirstInteraction();
     setScannerOpen(true);
-  }, [showGuide, dismissGuide, preferences.motionEnabled, requestMotionPermission, updatePreferences]);
+  }, [showGuide, dismissGuide, handleFirstInteraction]);
 
   const handleScannedRoom = useCallback(
     ({ roomId, relayOrigin }: ScannedQRTarget) => {
@@ -289,6 +307,7 @@ export default function App() {
         socketStatus={status}
         transport={transport}
         mobileCount={peerCounts.mobile}
+        osBridgeConnected={osBridgeConnected}
         latencyMs={latencyMs}
         lanAddresses={lanAddresses}
         onSwitchToMobile={() => setRole('mobile')}
@@ -302,6 +321,9 @@ export default function App() {
       <MouseController
         preferences={preferences}
         onCommand={sendCommand}
+        onTouchGlideChange={setTouchGliding}
+        onTapImpact={handleTapImpact}
+        onFirstInteraction={handleFirstInteraction}
         showGuide={showGuide}
         onDismissGuide={dismissGuide}
       />

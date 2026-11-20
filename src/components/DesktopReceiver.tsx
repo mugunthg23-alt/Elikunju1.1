@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, ChevronDown, Copy, Download, MousePointer2, RefreshCw, Smartphone } from 'lucide-react';
+import { Check, Copy, Download, Maximize2, Minimize2, Monitor, MousePointer2, RefreshCw, Smartphone } from 'lucide-react';
 import type { MouseCommand } from '../types/mouse';
 import type { SocketStatus, TransportKind } from '../hooks/useMouseSocket';
 import {
   buildClientNodeBridgeScript,
   buildClientPythonBridgeScript,
+  buildClientWindowsBatBridgeScript,
   triggerTextFileDownload,
 } from '../lib/bridgeScripts';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -16,6 +17,7 @@ interface DesktopReceiverProps {
   socketStatus: SocketStatus;
   transport: TransportKind;
   mobileCount: number;
+  osBridgeConnected: boolean;
   latencyMs: number | null;
   lanAddresses: string[];
   onSwitchToMobile: () => void;
@@ -35,6 +37,7 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
   socketStatus,
   transport,
   mobileCount,
+  osBridgeConnected,
   latencyMs,
   lanAddresses,
   onSwitchToMobile,
@@ -47,6 +50,8 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
 
   const [cursor, setCursor] = useState({ x: initialX, y: initialY, pressed: false, active: false });
   const cursorRef = useRef({ x: initialX, y: initialY, pressed: false, active: false });
+  const pendingMoveRef = useRef({ dx: 0, dy: 0 });
+  const interpRafRef = useRef<number | null>(null);
   const downOriginRef = useRef<{ x: number; y: number; button: 'left' | 'right' } | null>(null);
   const activeTimerRef = useRef<number | null>(null);
 
@@ -56,10 +61,67 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
   const [activeTile, setActiveTile] = useState<string | null>(null);
   const [lastAction, setLastAction] = useState<string | null>(null);
   const [copiedPhoneUrl, setCopiedPhoneUrl] = useState(false);
+  const [isFullScreen, setIsFullScreen] = useState(false);
 
   const markerIdRef = useRef(0);
 
   const phoneUrl = `${window.location.origin}/?mode=mobile&room=${encodeURIComponent(roomId)}`;
+
+  const toggleFullScreen = useCallback(async () => {
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => Promise<void> | void;
+    };
+    const root = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void> | void;
+    };
+
+    if (!isFullScreen) {
+      setIsFullScreen(true);
+      try {
+        if (root.requestFullscreen) {
+          await root.requestFullscreen();
+        } else if (root.webkitRequestFullscreen) {
+          await root.webkitRequestFullscreen();
+        }
+      } catch {
+        // Inside an iframe without fullscreen permission, full-viewport CSS mode still expands edge-to-edge cleanly
+      }
+    } else {
+      setIsFullScreen(false);
+      try {
+        if (doc.fullscreenElement && doc.exitFullscreen) {
+          await doc.exitFullscreen();
+        } else if (doc.webkitFullscreenElement && doc.webkitExitFullscreen) {
+          await doc.webkitExitFullscreen();
+        }
+      } catch {
+        // Ignore exit errors
+      }
+    }
+  }, [isFullScreen]);
+
+  useEffect(() => {
+    const onFsChange = () => {
+      const doc = document as Document & { webkitFullscreenElement?: Element | null };
+      if (!doc.fullscreenElement && !doc.webkitFullscreenElement) {
+        setIsFullScreen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isFullScreen) {
+        setIsFullScreen(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    document.addEventListener('webkitfullscreenchange', onFsChange);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange);
+      document.removeEventListener('webkitfullscreenchange', onFsChange);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [isFullScreen]);
 
   const handleCopyPhoneUrl = async () => {
     try {
@@ -132,28 +194,71 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
   }, []);
 
   useEffect(() => {
-    registerCommandHandler((cmd) => {
+    const flushImmediate = () => {
+      const p = pendingMoveRef.current;
+      if (Math.abs(p.dx) > 0.01 || Math.abs(p.dy) > 0.01) {
+        const maxW = Math.max(320, window.innerWidth - 16);
+        const maxH = Math.max(320, window.innerHeight - 16);
+        cursorRef.current = {
+          ...cursorRef.current,
+          x: Math.max(8, Math.min(maxW, cursorRef.current.x + p.dx)),
+          y: Math.max(8, Math.min(maxH, cursorRef.current.y + p.dy)),
+        };
+        p.dx = 0;
+        p.dy = 0;
+        setCursor({ ...cursorRef.current });
+      }
+    };
+
+    const tickSmoothMove = () => {
+      const p = pendingMoveRef.current;
+      if (Math.abs(p.dx) < 0.05 && Math.abs(p.dy) < 0.05) {
+        p.dx = 0;
+        p.dy = 0;
+        interpRafRef.current = null;
+        return;
+      }
+      const stepX = Math.abs(p.dx) < 1.2 ? p.dx : p.dx * 0.45;
+      const stepY = Math.abs(p.dy) < 1.2 ? p.dy : p.dy * 0.45;
+      p.dx -= stepX;
+      p.dy -= stepY;
+
       const maxW = Math.max(320, window.innerWidth - 16);
       const maxH = Math.max(320, window.innerHeight - 16);
+      cursorRef.current = {
+        ...cursorRef.current,
+        x: Math.max(8, Math.min(maxW, cursorRef.current.x + stepX)),
+        y: Math.max(8, Math.min(maxH, cursorRef.current.y + stepY)),
+        active: true,
+      };
+      setCursor({ ...cursorRef.current });
+      interpRafRef.current = window.requestAnimationFrame(tickSmoothMove);
+    };
 
+    registerCommandHandler((cmd) => {
       pulseCursorActive();
 
       if (cmd.type === 'move') {
-        const nextX = Math.max(8, Math.min(maxW, cursorRef.current.x + cmd.dx));
-        const nextY = Math.max(8, Math.min(maxH, cursorRef.current.y + cmd.dy));
-        cursorRef.current = { ...cursorRef.current, x: nextX, y: nextY, active: true };
-        setCursor({ ...cursorRef.current });
+        pendingMoveRef.current.dx += cmd.dx;
+        pendingMoveRef.current.dy += cmd.dy;
         setLastAction(cmd.source === 'motion' ? 'Phone Motion' : 'Touch Move');
+        if (interpRafRef.current === null) {
+          interpRafRef.current = window.requestAnimationFrame(tickSmoothMove);
+        }
       } else if (cmd.type === 'click') {
+        flushImmediate();
         triggerRemoteClick(cursorRef.current.x, cursorRef.current.y, cmd.button, false);
       } else if (cmd.type === 'dblclick') {
+        flushImmediate();
         triggerRemoteClick(cursorRef.current.x, cursorRef.current.y, cmd.button, true);
       } else if (cmd.type === 'down') {
+        flushImmediate();
         downOriginRef.current = { x: cursorRef.current.x, y: cursorRef.current.y, button: cmd.button };
         cursorRef.current = { ...cursorRef.current, pressed: true };
         setCursor({ ...cursorRef.current });
         setLastAction(cmd.button === 'right' ? 'Right Hold' : 'Left Hold');
       } else if (cmd.type === 'up') {
+        flushImmediate();
         cursorRef.current = { ...cursorRef.current, pressed: false };
         setCursor({ ...cursorRef.current });
         const origin = downOriginRef.current;
@@ -166,7 +271,6 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
         const deltaY = cmd.dy * 7;
         const deltaX = cmd.dx * 7;
 
-        // Scroll whichever scrollable container is under the remote cursor, or fallback to scroll pane + window
         const hovered = document.elementFromPoint(cursorRef.current.x, cursorRef.current.y) as HTMLElement | null;
         const hoveredScrollable = hovered?.closest('[data-remote-scroll]') as HTMLElement | null;
 
@@ -182,6 +286,13 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
         }
       }
     });
+
+    return () => {
+      if (interpRafRef.current !== null) {
+        window.cancelAnimationFrame(interpRafRef.current);
+        interpRafRef.current = null;
+      }
+    };
   }, [registerCommandHandler, triggerRemoteClick, pulseCursorActive]);
 
   return (
@@ -220,6 +331,15 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
           <button
             type="button"
             data-ignore-remote-click="true"
+            onClick={() => void toggleFullScreen()}
+            className="inline-flex min-h-[40px] items-center gap-2 rounded-xl border border-[#C78E65]/50 bg-[#151F32] px-4 py-2 text-xs font-medium text-[#F5D6BC] hover:bg-[#1C2942] whitespace-nowrap shrink-0 transition-colors"
+          >
+            {isFullScreen ? <Minimize2 className="w-4 h-4 shrink-0" /> : <Maximize2 className="w-4 h-4 shrink-0" />}
+            <span>{isFullScreen ? 'Exit Full Screen' : 'Full Screen'}</span>
+          </button>
+          <button
+            type="button"
+            data-ignore-remote-click="true"
             onClick={onSwitchToMobile}
             className="inline-flex min-h-[40px] items-center gap-2 rounded-xl border border-slate-700 bg-slate-800/80 px-4 py-2 text-xs font-medium text-slate-100 hover:bg-slate-700 whitespace-nowrap shrink-0 transition-colors"
           >
@@ -229,23 +349,125 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
         </div>
       </header>
 
-      {/* Main 2-column desktop workspace */}
-      <main className="mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-6 p-6 lg:grid-cols-12">
-        {/* Left column: Scan QR from Mobile to Pair */}
-        <aside className="flex flex-col gap-5 lg:col-span-4">
+      {/* Main workspace: 2-column standard view OR 100% edge-to-edge Full Screen test view */}
+      <main
+        className={
+          isFullScreen
+            ? 'flex flex-1 flex-col w-full p-4'
+            : 'mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-6 p-6 lg:grid-cols-12'
+        }
+      >
+        {/* Left column: Step 1 Full Laptop Control + Step 2 Scan QR (hidden in Full Screen stage mode) */}
+        <aside className={isFullScreen ? 'hidden' : 'flex flex-col gap-5 lg:col-span-4'}>
+          {/* Step 1: Unlock Whole-Laptop OS Mouse Control */}
+          <div
+            className={`rounded-2xl border p-5 space-y-3.5 ${
+              osBridgeConnected
+                ? 'border-emerald-500/50 bg-emerald-950/25'
+                : 'border-[#C78E65]/45 bg-[#151F32]'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <Monitor className={`h-5 w-5 shrink-0 ${osBridgeConnected ? 'text-emerald-400' : 'text-[#C78E65]'}`} />
+                <h2 className="font-display text-base font-semibold tracking-tight text-slate-100">
+                  1. Control Entire Laptop
+                </h2>
+              </div>
+              <span
+                className={`text-xs font-semibold whitespace-nowrap shrink-0 ${
+                  osBridgeConnected ? 'text-emerald-300' : 'text-amber-300'
+                }`}
+              >
+                {osBridgeConnected ? 'Whole Laptop Live' : 'Browser Only'}
+              </span>
+            </div>
+
+            {osBridgeConnected ? (
+              <p className="text-xs text-emerald-200/95 leading-relaxed">
+                Full Windows/OS mouse control is active on room <span className="font-mono-num font-semibold">{roomId}</span>. Minimize this browser and use your phone like a real mouse across your entire laptop!
+              </p>
+            ) : (
+              <p className="text-xs text-slate-300 leading-relaxed">
+                To move your mouse <strong>outside this browser across your entire laptop</strong>, click below and double-click the downloaded file once (uses built-in Windows — no install needed).
+              </p>
+            )}
+
+            <button
+              type="button"
+              onClick={() =>
+                triggerTextFileDownload(
+                  `eli-kunju-laptop-${roomId}.bat`,
+                  buildClientWindowsBatBridgeScript(roomId),
+                  'application/x-msdos-program;charset=utf-8'
+                )
+              }
+              className="inline-flex w-full min-h-[46px] items-center justify-center gap-2 rounded-xl bg-[#C78E65] px-4 text-sm font-semibold text-[#101827] hover:bg-[#D59E76] active:scale-[0.98] transition-all whitespace-nowrap"
+            >
+              <Download className="w-4 h-4 shrink-0" />
+              <span>Download Windows Mouse Enabler (.bat)</span>
+            </button>
+
+            {!osBridgeConnected && (
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                If Windows Defender asks, click <strong>More info → Run anyway</strong>. Keep the black window minimized while using your mouse.
+              </p>
+            )}
+
+            <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-800/80 text-xs text-slate-400">
+              <span>Mac / Linux:</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    triggerTextFileDownload(
+                      'eli-kunju-bridge.py',
+                      buildClientPythonBridgeScript(roomId),
+                      'text/x-python;charset=utf-8'
+                    )
+                  }
+                  className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#0E1524] px-2.5 text-xs font-medium text-slate-200 hover:border-[#C78E65]/70 whitespace-nowrap transition-colors"
+                >
+                  <Download className="w-3 h-3 shrink-0" />
+                  <span>Python (.py)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    triggerTextFileDownload(
+                      'eli-kunju-bridge.mjs',
+                      buildClientNodeBridgeScript(roomId),
+                      'application/javascript;charset=utf-8'
+                    )
+                  }
+                  className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#0E1524] px-2.5 text-xs font-medium text-slate-200 hover:border-[#C78E65]/70 whitespace-nowrap transition-colors"
+                >
+                  <Download className="w-3 h-3 shrink-0" />
+                  <span>Node (.mjs)</span>
+                </button>
+              </div>
+            </div>
+            {lanAddresses.length > 0 && (
+              <p className="text-[11px] text-slate-500">
+                Local IP: <span className="font-mono-num text-slate-400">{lanAddresses[0]}</span>
+              </p>
+            )}
+          </div>
+
+          {/* Step 2: Scan QR from Mobile to Pair */}
           <div className="rounded-2xl border border-slate-800 bg-[#151F32] p-6 space-y-5">
             <div>
-              <h1 className="font-display text-xl font-semibold tracking-tight text-slate-100">
-                Scan From Your Mobile
+              <h1 className="font-display text-lg font-semibold tracking-tight text-slate-100">
+                2. Scan From Your Mobile
               </h1>
-              <p className="mt-1.5 text-sm text-slate-400 leading-relaxed">
-                Scan this QR with your phone camera or inside eli kunju. Whichever phone scans it immediately controls the live cursor on this laptop screen.
+              <p className="mt-1 text-xs text-slate-400 leading-relaxed">
+                Scan this QR with your phone camera or the scanner icon inside eli kunju. Whichever phone scans it becomes your live mouse.
               </p>
             </div>
 
             {/* Scannable QR Code */}
             <div className="flex flex-col items-center rounded-2xl border border-slate-800 bg-[#0E1524] p-5">
-              <PairingQRCode value={phoneUrl} size={196} />
+              <PairingQRCode value={phoneUrl} size={188} />
               <div className="mt-4 flex items-center gap-3 text-xs text-slate-400">
                 <span>Code</span>
                 <span className="font-mono-num text-base font-semibold tracking-[0.2em] text-[#C78E65]">
@@ -253,12 +475,12 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
                 </span>
               </div>
               <p
-                className={`mt-2 text-xs font-medium ${
+                className={`mt-2 text-xs font-medium text-center ${
                   mobileCount > 0 ? 'text-emerald-300' : 'text-slate-400'
                 }`}
               >
                 {mobileCount > 0
-                  ? `Mobile live — move phone, tap sides, or drag head`
+                  ? 'Mobile live — glide screen, move phone, tap sides, or drag head'
                   : 'Waiting for mobile scan…'}
               </p>
             </div>
@@ -297,68 +519,50 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
               </div>
             </div>
           </div>
-
-          {/* Optional advanced bridge tucked cleanly inside a collapsible section */}
-          <details className="group rounded-2xl border border-slate-800 bg-[#151F32] px-6 py-4">
-            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-xs font-medium text-slate-300">
-              <span>Optional: Move Windows/Mac OS cursor outside browser</span>
-              <ChevronDown className="h-4 w-4 text-slate-400 transition-transform group-open:rotate-180 shrink-0" />
-            </summary>
-            <div className="mt-4 space-y-3 border-t border-slate-800 pt-4">
-              <p className="text-xs text-slate-400 leading-relaxed">
-                For security, web browsers only move the cursor inside this browser window. To move your system-wide Windows/macOS arrow across other apps, run a bridge script with room <span className="font-mono-num text-slate-200">{roomId}</span>.
-              </p>
-              {lanAddresses.length > 0 && (
-                <p className="text-xs text-slate-400">
-                  Local IP: <span className="font-mono-num text-slate-300">{lanAddresses[0]}</span>
-                </p>
-              )}
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  onClick={() =>
-                    triggerTextFileDownload(
-                      'eli-kunju-bridge.py',
-                      buildClientPythonBridgeScript(roomId),
-                      'text/x-python;charset=utf-8'
-                    )
-                  }
-                  className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-[#0E1524] px-3 text-xs font-medium text-slate-200 hover:border-[#C78E65]/70 hover:bg-slate-800 whitespace-nowrap transition-colors"
-                >
-                  <Download className="w-3.5 h-3.5 shrink-0" />
-                  <span>Python (.py)</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    triggerTextFileDownload(
-                      'eli-kunju-bridge.mjs',
-                      buildClientNodeBridgeScript(roomId),
-                      'application/javascript;charset=utf-8'
-                    )
-                  }
-                  className="inline-flex min-h-[40px] items-center justify-center gap-1.5 rounded-xl border border-slate-700 bg-[#0E1524] px-3 text-xs font-medium text-slate-200 hover:border-[#C78E65]/70 hover:bg-slate-800 whitespace-nowrap transition-colors"
-                >
-                  <Download className="w-3.5 h-3.5 shrink-0" />
-                  <span>Node.js (.mjs)</span>
-                </button>
-              </div>
-              <p className="font-mono-num text-[11px] text-slate-400">
-                Run: <span className="text-slate-200">pip install websockets pyautogui</span> then <span className="text-slate-200">python eli-kunju-bridge.py</span>
-              </p>
-            </div>
-          </details>
         </aside>
 
         {/* Right column: Live Interactive Cursor Stage */}
-        <section className="relative min-h-[520px] overflow-hidden rounded-2xl border border-slate-800 bg-[#0E1524] p-6 lg:col-span-8 flex flex-col gap-6">
+        <section
+          className={`relative overflow-hidden rounded-2xl border border-slate-800 bg-[#0E1524] p-6 flex flex-col gap-5 ${
+            isFullScreen ? 'flex-1 min-h-[calc(100dvh-110px)] w-full' : 'min-h-[520px] lg:col-span-8'
+          }`}
+        >
+          {osBridgeConnected ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/45 bg-emerald-950/35 px-4 py-3 text-xs text-emerald-100">
+              <span>
+                <strong className="text-emerald-300">Whole Laptop Mouse Live:</strong> Your real Windows/OS mouse arrow is now moving across your Desktop, folders, and all apps. Minimize this browser to use it anywhere!
+              </span>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#C78E65]/40 bg-[#151F32] px-4 py-3 text-xs text-slate-200">
+              <p className="leading-relaxed max-w-xl">
+                <strong className="text-amber-300">Browser-Only Preview:</strong> Browsers block websites from leaving this tab. To move your mouse onto your <strong>Desktop &amp; folders</strong>, download and double-click the Mouse Enabler once.
+              </p>
+              <button
+                type="button"
+                data-ignore-remote-click="true"
+                onClick={() =>
+                  triggerTextFileDownload(
+                    `eli-kunju-laptop-${roomId}.bat`,
+                    buildClientWindowsBatBridgeScript(roomId),
+                    'application/x-msdos-program;charset=utf-8'
+                  )
+                }
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#C78E65] px-3.5 text-xs font-semibold text-[#101827] hover:bg-[#D59E76] whitespace-nowrap shrink-0 transition-colors"
+              >
+                <Download className="w-3.5 h-3.5 shrink-0" />
+                <span>Enable Whole Laptop (.bat)</span>
+              </button>
+            </div>
+          )}
+
           <div className="flex items-center justify-between gap-4 border-b border-slate-800/80 pb-4">
             <div>
               <h2 className="font-display text-base font-semibold text-slate-100">
-                Live Cursor Stage
+                {osBridgeConnected ? 'Whole-Laptop Live Activity' : 'Browser Preview Stage'}
               </h2>
               <p className="text-xs text-slate-400">
-                Tilt/move your phone or slide its screen to glide the cursor across this window. Tap left/right sides to click and drag the mouse head to scroll.
+                Move your phone flat on a desk like a normal mouse, tilt it in hand, or glide its screen. Tap left/right sides to click and drag the mouse head to scroll.
               </p>
             </div>
             <span className="font-mono-num text-xs text-slate-400 whitespace-nowrap shrink-0">
@@ -442,35 +646,37 @@ export const DesktopReceiver: React.FC<DesktopReceiverProps> = ({
         </div>
       )}
 
-      {/* Full-window live remote cursor + click ripples */}
-      <div className="pointer-events-none fixed inset-0 z-50 overflow-hidden">
-        {clickMarkers.map((m) => (
-          <span
-            key={m.id}
-            style={{ left: m.x, top: m.y }}
-            className={`pointer-events-none absolute h-12 w-12 rounded-full border-2 animate-mouse-ripple ${
-              m.button === 'left'
-                ? 'border-[#F7DFC9] bg-[#C78E65]/25'
-                : 'border-sky-400 bg-sky-400/25'
-            }`}
-          />
-        ))}
+      {/* Browser-preview remote cursor (hidden automatically once real Whole-Laptop OS cursor is active) */}
+      {!osBridgeConnected && (
+        <div className="pointer-events-none fixed inset-0 z-50 overflow-hidden">
+          {clickMarkers.map((m) => (
+            <span
+              key={m.id}
+              style={{ left: m.x, top: m.y }}
+              className={`pointer-events-none absolute h-12 w-12 rounded-full border-2 animate-mouse-ripple ${
+                m.button === 'left'
+                  ? 'border-[#F7DFC9] bg-[#C78E65]/25'
+                  : 'border-sky-400 bg-sky-400/25'
+              }`}
+            />
+          ))}
 
-        <div
-          style={{
-            transform: `translate3d(${cursor.x}px, ${cursor.y}px, 0) scale(${cursor.pressed ? 0.88 : 1})`,
-          }}
-          className="pointer-events-none absolute left-0 top-0 will-change-transform transition-transform duration-75"
-        >
-          {cursor.active && (
-            <span className="absolute -left-2.5 -top-2.5 h-8 w-8 rounded-full bg-[#C78E65]/25 blur-[2px]" />
-          )}
-          <MousePointer2
-            className="relative h-7 w-7 -translate-x-1 -translate-y-1 text-white fill-[#C78E65] drop-shadow-[0_3px_10px_rgba(0,0,0,0.85)]"
-            strokeWidth={2}
-          />
+          <div
+            style={{
+              transform: `translate3d(${cursor.x}px, ${cursor.y}px, 0) scale(${cursor.pressed ? 0.88 : 1})`,
+            }}
+            className="pointer-events-none absolute left-0 top-0 will-change-transform transition-transform duration-75"
+          >
+            {cursor.active && (
+              <span className="absolute -left-2.5 -top-2.5 h-8 w-8 rounded-full bg-[#C78E65]/25 blur-[2px]" />
+            )}
+            <MousePointer2
+              className="relative h-7 w-7 -translate-x-1 -translate-y-1 text-white fill-[#C78E65] drop-shadow-[0_3px_10px_rgba(0,0,0,0.85)]"
+              strokeWidth={2}
+            />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
